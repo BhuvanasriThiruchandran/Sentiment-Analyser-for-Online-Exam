@@ -1,0 +1,226 @@
+###############################################
+# SENTIMENT ANALYSER – ONLINE EXAM DASHBOARD
+###############################################
+
+# ---- Load packages ----
+packages <- c(
+  "shiny","shinydashboard","tidyverse","tidytext","DT",
+  "wordcloud2","plotly","shinycssloaders","shinyjs",
+  "shinyWidgets"
+)
+lapply(packages, library, character.only = TRUE)
+
+# ---- Sample data (used if user doesn’t upload a CSV) ----
+feedback_data <- data.frame(
+  feedback = c(
+    "I liked that the online exam had instant submission feedback.",
+    "Average experience overall.",
+    "The proctoring system was stressful and frustrating.",
+    "The interface was intuitive and easy to navigate.",
+    "Technical difficulties caused me to lose time.",
+    "Great exam design and fair questions.",
+    "The login process was confusing.",
+    "Neutral feeling about the exam timing.",
+    "I finished early and felt confident.",
+    "The exam crashed twice, it was a disaster."
+  ),
+  stringsAsFactors = FALSE
+)
+
+# ---- Sentiment function (bing and afinn) ----
+perform_sentiment <- function(df, lexicon = "bing") {
+  
+  tidy <- df %>%
+    mutate(id = row_number()) %>%
+    unnest_tokens(word, feedback) %>%
+    anti_join(stop_words, by = "word") %>%
+    filter(!str_detect(word, "[0-9]"), nchar(word) > 2)
+  
+  if (lexicon == "afinn") {
+    
+    af <- get_sentiments("afinn")
+    
+    score_df <- tidy %>%
+      inner_join(af, by = "word") %>%
+      group_by(id) %>%
+      summarise(score = sum(value)) %>%
+      mutate(category = case_when(
+        score > 0 ~ "Positive",
+        score < 0 ~ "Negative",
+        TRUE ~ "Neutral"
+      ))
+    
+    final <- df %>%
+      mutate(id = row_number()) %>%
+      left_join(score_df, by = "id") %>%
+      mutate(score = replace_na(score, 0),
+             category = replace_na(category, "Neutral"))
+    
+  } else {
+    
+    bing <- get_sentiments("bing")
+    
+    score_df <- tidy %>%
+      inner_join(bing, by = "word") %>%
+      count(id, sentiment) %>%
+      pivot_wider(names_from = sentiment, values_from = n, values_fill = 0)
+    
+    final <- df %>%
+      mutate(id = row_number()) %>%
+      left_join(score_df, by = "id") %>%
+      mutate(
+        positive = replace_na(positive, 0),
+        negative = replace_na(negative, 0),
+        score = positive - negative,
+        category = case_when(
+          score > 0 ~ "Positive",
+          score < 0 ~ "Negative",
+          TRUE ~ "Neutral"
+        )
+      )
+  }
+  
+  return(final)
+}
+
+###############################################
+# ----------------- UI -----------------------
+###############################################
+
+ui <- dashboardPage(
+  skin = "purple",
+  dashboardHeader(title = "Online Exam Sentiment Analyzer"),
+  dashboardSidebar(
+    sidebarMenu(
+      menuItem("Dashboard", tabName = "dash", icon = icon("chart-pie")),
+      menuItem("Data Table", tabName = "data", icon = icon("table"))
+    ),
+    hr(),
+    fileInput("file", "Upload CSV", accept = ".csv"),
+    selectInput("lexicon", "Lexicon", c("bing", "afinn")),
+    textInput("search", "Search in feedback:", ""),
+    sliderInput("top_n", "Top Words:", min = 5, max = 30, value = 12),
+    actionButton("run", "Analyze", icon = icon("play")),
+    br(), br(),
+    downloadButton("download", "Download CSV")
+  ),
+  dashboardBody(
+    shinyjs::useShinyjs(),
+    tabItems(
+      tabItem("dash",
+              fluidRow(
+                valueBoxOutput("vb_pos", width = 4),
+                valueBoxOutput("vb_neu", width = 4),
+                valueBoxOutput("vb_neg", width = 4)
+              ),
+              fluidRow(
+                box(width = 6, title = "Sentiment Distribution",
+                    withSpinner(plotlyOutput("barplot", height = "300px"))),
+                box(width = 6, title = "Wordcloud",
+                    withSpinner(wordcloud2Output("wc", height = "300px")))
+              ),
+              fluidRow(
+                box(width = 6, title = "Top Words",
+                    withSpinner(plotlyOutput("top_words", height = "300px"))),
+                box(width = 6, title = "Score Histogram",
+                    withSpinner(plotlyOutput("hist", height = "300px")))
+              )
+      ),
+      tabItem("data",
+              box(width = 12, title = "Sentiment Table",
+                  DTOutput("table"))
+      )
+    )
+  )
+)
+
+###############################################
+# ---------------- SERVER ---------------------
+###############################################
+
+server <- function(input, output, session) {
+  
+  # Input dataset
+  df_in <- reactive({
+    if (is.null(input$file)) return(feedback_data)
+    read.csv(input$file$datapath, stringsAsFactors = FALSE)
+  })
+  
+  # Run sentiment
+  analysed <- eventReactive(input$run, {
+    df <- df_in()
+    if (!"feedback" %in% names(df))
+      stop("CSV must contain a column named 'feedback'")
+    perform_sentiment(df, input$lexicon)
+  }, ignoreNULL = FALSE)
+  
+  # Search filter
+  filtered <- reactive({
+    d <- analysed()
+    if (input$search != "")
+      d <- d %>% filter(str_detect(tolower(feedback), tolower(input$search)))
+    d
+  })
+  
+  # Value boxes
+  output$vb_pos <- renderValueBox({
+    n <- sum(filtered()$category == "Positive")
+    valueBox(n, "Positive", icon = icon("thumbs-up"), color = "purple")
+  })
+  output$vb_neu <- renderValueBox({
+    n <- sum(filtered()$category == "Neutral")
+    valueBox(n, "Neutral", icon = icon("minus"), color = "yellow")
+  })
+  output$vb_neg <- renderValueBox({
+    n <- sum(filtered()$category == "Negative")
+    valueBox(n, "Negative", icon = icon("thumbs-down"), color = "red")
+  })
+  
+  # Bar plot
+  output$barplot <- renderPlotly({
+    df <- filtered() %>%
+      count(category)
+    plot_ly(df, x = ~category, y = ~n, type = "bar",
+            marker = list(color = c("#6A1B9A","#00BFFF","#1A4740")))
+  })
+  
+  # Wordcloud
+  output$wc <- renderWordcloud2({
+    tidy <- df_in() %>%
+      unnest_tokens(word, feedback) %>%
+      anti_join(stop_words)
+    top <- tidy %>% count(word, sort = TRUE) %>% top_n(input$top_n, n)
+    wordcloud2(top)
+  })
+  
+  # Top words bar chart
+  output$top_words <- renderPlotly({
+    tidy <- df_in() %>%
+      unnest_tokens(word, feedback) %>%
+      anti_join(stop_words)
+    top <- tidy %>% count(word, sort = TRUE) %>% top_n(input$top_n, n)
+    plot_ly(top, x = ~n, y = ~reorder(word, n), type = "bar", orientation = "h")
+  })
+  
+  # Histogram
+  output$hist <- renderPlotly({
+    df <- filtered()
+    plot_ly(df, x = ~score, type = "histogram")
+  })
+  
+  # Data table
+  output$table <- renderDT({
+    datatable(filtered())
+  })
+  
+  # Download
+  output$download <- downloadHandler(
+    filename = "sentiment_results.csv",
+    content = function(file) {
+      write.csv(filtered(), file, row.names = FALSE)
+    }
+  )
+}
+
+# ---- Run App ----
+shinyApp(ui, server)
